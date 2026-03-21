@@ -3,14 +3,14 @@
 	"id": "datapackcommands",
 	"version": "${version}",
 	"name": "DatapackCommands",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"description": "Register custom commands that execute datapack functions - server-side only, no client mod needed.",
 	"authors": [
 		"Jacob0225",
-		"Zee"
+		"zeeesea"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"homepage": "https://modrinth.com/project/datapack-commands",
+		"sources": "https://github.com/zeeesea/DatapackCommands"
 	},
 	"license": "CC0-1.0",
 	"icon": "assets/datapackcommands/icon.png",
