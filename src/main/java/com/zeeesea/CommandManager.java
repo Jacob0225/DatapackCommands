@@ -32,7 +32,7 @@ public class CommandManager {
 
     private static class ConfigData {
         Map<String, String> commands = new HashMap<>();
-        boolean feedbackEnabled = true;
+        boolean feedbackEnabled = false;
     }
 
     public void load() {
@@ -92,4 +92,3 @@ public class CommandManager {
         return commands.get(name);
     }
 }
-
