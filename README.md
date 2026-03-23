@@ -13,14 +13,20 @@ All management is done through the `/cgen` command, which requires **operator le
 ```
 /cgen create <commandname> <namespace:function>
 ```
+(Subcommands are also possible)
+
+```
+/cgen create "<commandname> <arg> <etc>" <namespace:function>
+```
 
 Registers a new `/<commandname>` that runs the specified datapack function when used. The command is available to all players immediately.
+If using a subcommand make sure to add a " around the main command and subcommand
 
 **Example:**
 ```
-/cgen create spawn example:spawn_zombie
+/cgen create ""spawn zombie"" example:spawn_zombie
 ```
-Players can now run `/spawn_zombie` and it will execute `example:spawn_zombie`.
+Players can now run `/spawn zombie` and it will execute `example:spawn_zombie`.
 
 ---
 
