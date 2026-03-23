@@ -53,39 +53,63 @@ public class DatapackCommands implements ModInitializer {
                             }
                         })
                         .then(net.minecraft.server.command.CommandManager.literal("create")
-                                .then(net.minecraft.server.command.CommandManager.argument("commandname",
-                                                com.mojang.brigadier.arguments.StringArgumentType.word())
-                                        .then(net.minecraft.server.command.CommandManager.argument("function",
-                                                        com.mojang.brigadier.arguments.StringArgumentType.greedyString())
-                                                .executes(ctx -> {
-                                                    String cmd = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "commandname");
-                                                    String func = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "function").trim();
-                                                    ServerCommandSource source = ctx.getSource();
+                                .then(net.minecraft.server.command.CommandManager.argument("\"<command>\" <namespace:function>",
+                                                com.mojang.brigadier.arguments.StringArgumentType.greedyString())
+                                        .executes(ctx -> {
+                                            String raw = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "\"<command>\" <namespace:function>").trim();
+                                            ServerCommandSource source = ctx.getSource();
 
-                                                    LOGGER.info("[CGEN DEBUG] Creating command /{} -> {}", cmd, func);
+                                            // Split into "tp creative" and "example:func" on the last space-separated token after the last quote block
+                                            // Format: "command path" namespace:function  OR  singleword namespace:function
+                                            String cmdPath;
+                                            String func;
 
-                                                    if (!commandManager.registerCommand(cmd, func)) {
-                                                        source.sendError(Text.literal("Command already exists: /" + cmd));
-                                                        return 0;
-                                                    }
+                                            if (raw.startsWith("\"")) {
+                                                int closing = raw.indexOf('"', 1);
+                                                if (closing == -1) {
+                                                    source.sendError(Text.literal("Missing closing quote in command name."));
+                                                    return 0;
+                                                }
+                                                cmdPath = raw.substring(1, closing).trim();
+                                                func = raw.substring(closing + 1).trim();
+                                            } else {
+                                                int lastSpace = raw.lastIndexOf(' ');
+                                                if (lastSpace == -1) {
+                                                    source.sendError(Text.literal("Usage: /cgen create \"<command> [subcommand]\" <namespace:function>"));
+                                                    return 0;
+                                                }
+                                                cmdPath = raw.substring(0, lastSpace).trim();
+                                                func = raw.substring(lastSpace + 1).trim();
+                                            }
 
-                                                    registerCustomCommand(cachedDispatcher, cmd, func);
+                                            if (cmdPath.isEmpty() || func.isEmpty()) {
+                                                source.sendError(Text.literal("Usage: /cgen create \"<command> [subcommand]\" <namespace:function>"));
+                                                return 0;
+                                            }
 
-                                                    source.sendMessage(Text.literal("Created command /" + cmd + " -> " + func));
-                                                    return 1;
-                                                })
-                                        )
+                                            LOGGER.info("[CGEN DEBUG] Creating command /{} -> {}", cmdPath, func);
+
+                                            if (!commandManager.registerCommand(cmdPath, func)) {
+                                                source.sendError(Text.literal("Command already exists: /" + cmdPath));
+                                                return 0;
+                                            }
+
+                                            registerCustomCommand(cachedDispatcher, cmdPath, func);
+
+                                            source.sendMessage(Text.literal("Created command /" + cmdPath + " -> " + func));
+                                            return 1;
+                                        })
                                 )
                         )
                         .then(net.minecraft.server.command.CommandManager.literal("remove")
                                 .then(net.minecraft.server.command.CommandManager.argument("commandname",
-                                                com.mojang.brigadier.arguments.StringArgumentType.word())
+                                                com.mojang.brigadier.arguments.StringArgumentType.greedyString())
                                         .suggests((ctx, builder) -> {
                                             commandManager.getCommands().keySet().forEach(builder::suggest);
                                             return builder.buildFuture();
                                         })
                                         .executes(ctx -> {
-                                            String cmd = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "commandname");
+                                            String cmd = com.mojang.brigadier.arguments.StringArgumentType.getString(ctx, "commandname").trim();
                                             LOGGER.info("[CGEN DEBUG] remove: cmd='{}'", cmd);
 
                                             if (!commandManager.removeCommand(cmd)) {
@@ -93,7 +117,8 @@ public class DatapackCommands implements ModInitializer {
                                                 return 0;
                                             }
 
-                                            unregisterCommand(dispatcher, cmd);
+                                            // Only unregister the root token from Brigadier
+                                            unregisterCommand(dispatcher, cmd.split(" ")[0]);
                                             ctx.getSource().sendMessage(Text.literal("Command /" + cmd + " removed!"));
                                             return 1;
                                         })
@@ -152,10 +177,13 @@ public class DatapackCommands implements ModInitializer {
         commandManager.getCommands().forEach((cmd, func) -> registerCustomCommand(dispatcher, cmd, func));
     }
 
-    private void registerCustomCommand(com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher, String cmd, String func) {
-        LOGGER.info("[CGEN DEBUG] Registering: /{} -> {}", cmd, func);
-        dispatcher.register(
-                net.minecraft.server.command.CommandManager.literal(cmd)
+    private void registerCustomCommand(com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher, String cmdPath, String func) {
+        LOGGER.info("[CGEN DEBUG] Registering: /{} -> {}", cmdPath, func);
+        String[] tokens = cmdPath.split(" ");
+
+        // Build the innermost executes node
+        com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> innermost =
+                net.minecraft.server.command.CommandManager.literal(tokens[tokens.length - 1])
                         .requires(source -> true)
                         .executes(ctx -> {
                             MinecraftServer server = ctx.getSource().getServer();
@@ -165,7 +193,7 @@ public class DatapackCommands implements ModInitializer {
                             ServerCommandSource execSource = commandManager.isFeedbackEnabled()
                                     ? source : source.withSilent();
 
-                            LOGGER.info("[CGEN DEBUG] Executing /{} -> {} as '{}'", cmd, func, source.getName());
+                            LOGGER.info("[CGEN DEBUG] Executing /{} -> {} as '{}'", cmdPath, func, source.getName());
 
                             com.mojang.brigadier.ParseResults<ServerCommandSource> parseResults =
                                     server.getCommandManager().getDispatcher().parse(execCmd, execSource);
@@ -175,8 +203,25 @@ public class DatapackCommands implements ModInitializer {
                                 source.sendMessage(Text.literal("Executed function: " + func));
                             }
                             return 1;
-                        })
-        );
+                        });
+
+        // If only one token, register directly
+        if (tokens.length == 1) {
+            dispatcher.register(innermost);
+        } else {
+            // Chain from outermost down: tokens[0].then(tokens[1].then(...innermost))
+            com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> node = innermost;
+            for (int i = tokens.length - 2; i >= 1; i--) {
+                node = net.minecraft.server.command.CommandManager.literal(tokens[i])
+                        .requires(source -> true)
+                        .then(node);
+            }
+            dispatcher.register(
+                    net.minecraft.server.command.CommandManager.literal(tokens[0])
+                            .requires(source -> true)
+                            .then(node)
+            );
+        }
         syncCommandsToAllPlayers();
     }
 
