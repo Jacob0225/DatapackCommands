@@ -42,7 +42,8 @@ public class DatapackCommands implements ModInitializer {
             }
         });
 
-        LOGGER.info("DatapackCommands initialized!");    }
+        LOGGER.info("DatapackCommands initialized!");
+    }
 
     private void registerCgenCommand(com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
         dispatcher.register(
@@ -276,3 +277,4 @@ public class DatapackCommands implements ModInitializer {
         return commandManager;
     }
 }
+
