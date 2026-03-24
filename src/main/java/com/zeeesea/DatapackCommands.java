@@ -36,6 +36,10 @@ public class DatapackCommands implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             cachedDispatcher = dispatcher;
             registerCgenCommand(dispatcher);
+            if (commandManager != null) {
+                LOGGER.info("[CGEN DEBUG] Re-registering custom commands after reload");
+                registerAllCustomCommands(dispatcher);
+            }
         });
 
         LOGGER.info("DatapackCommands initialized!");    }
