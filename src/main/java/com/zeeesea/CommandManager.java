@@ -73,7 +73,7 @@ public class CommandManager {
         return true;
     }
 
-    private boolean feedbackEnabled = true;
+    private boolean feedbackEnabled = false;
 
     public boolean isFeedbackEnabled() {
         return feedbackEnabled;
