@@ -12,6 +12,9 @@ import net.minecraft.text.MutableText;
 import net.minecraft.util.Identifier;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import java.lang.reflect.Field;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.Map;
 import java.util.stream.StreamSupport;
 
@@ -21,6 +24,7 @@ public class DatapackCommands implements ModInitializer {
     private static CommandManager commandManager;
     private static MinecraftServer cachedServer;
     private static com.mojang.brigadier.CommandDispatcher<ServerCommandSource> cachedDispatcher;
+    private final Set<String> registeredCustomRoots = new HashSet<>();
 
     @Override
     public void onInitialize() {
@@ -35,6 +39,7 @@ public class DatapackCommands implements ModInitializer {
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
             commandManager = null;
             cachedServer = null;
+            registeredCustomRoots.clear();
             LOGGER.info("[CGEN DEBUG] Server stopped, cache cleared");
         });
 
@@ -43,7 +48,7 @@ public class DatapackCommands implements ModInitializer {
             registerCgenCommand(dispatcher);
             if (commandManager != null) {
                 LOGGER.info("[CGEN DEBUG] Re-registering custom commands after reload");
-                registerAllCustomCommands(dispatcher);
+                rebuildCustomCommands(dispatcher);
             }
         });
 
@@ -91,7 +96,7 @@ public class DatapackCommands implements ModInitializer {
                         .then(net.minecraft.server.command.CommandManager.literal("create")
                                 .then(net.minecraft.server.command.CommandManager.argument(
                                                 "commandname",
-                                                com.mojang.brigadier.arguments.StringArgumentType.word())
+                                                com.mojang.brigadier.arguments.StringArgumentType.string())
                                         .then(net.minecraft.server.command.CommandManager.argument(
                                                         "function",
                                                         IdentifierArgumentType.identifier())
@@ -100,13 +105,27 @@ public class DatapackCommands implements ModInitializer {
                                                 .executes(ctx -> {
                                                     ServerCommandSource source = ctx.getSource();
                                                     String cmdPath = com.mojang.brigadier.arguments.StringArgumentType
-                                                            .getString(ctx, "commandname").trim();
+                                                            .getString(ctx, "commandname");
                                                     String func = IdentifierArgumentType
                                                             .getIdentifier(ctx, "function").toString();
+                                                    cmdPath = normalizeCommandPath(cmdPath);
 
                                                     if (cmdPath.isEmpty() || func.isEmpty()) {
                                                         source.sendError(Text.literal(
-                                                                "Usage: /cgen create <commandname> <namespace:function>"));
+                                                                "Usage: /cgen create <name> <namespace:function> (quote names with spaces)"));
+                                                        return 0;
+                                                    }
+
+                                                    if (!isValidCommandPath(cmdPath)) {
+                                                        source.sendError(Text.literal(
+                                                                "Invalid command name '" + cmdPath + "'. Use letters, numbers, underscore, max 32 chars per token."));
+                                                        return 0;
+                                                    }
+
+                                                    if (isConflictingRoot(dispatcher, cmdPath)) {
+                                                        String root = cmdPath.split(" ")[0];
+                                                        source.sendError(Text.literal(
+                                                                "Cannot use root '/" + root + "' because it already exists."));
                                                         return 0;
                                                     }
 
@@ -124,7 +143,7 @@ public class DatapackCommands implements ModInitializer {
                                                         return 0;
                                                     }
 
-                                                    registerCustomCommand(cachedDispatcher, cmdPath, func);
+                                                    registerCustomCommand(cachedDispatcher, cmdPath, func, true);
                                                     source.sendMessage(Text.literal("Created command /" + cmdPath + " -> " + func));
                                                     return 1;
                                                 })
@@ -135,14 +154,21 @@ public class DatapackCommands implements ModInitializer {
                         .then(net.minecraft.server.command.CommandManager.literal("remove")
                                 .then(net.minecraft.server.command.CommandManager.argument(
                                                 "commandname",
-                                                com.mojang.brigadier.arguments.StringArgumentType.greedyString())
+                                                com.mojang.brigadier.arguments.StringArgumentType.string())
                                         .suggests((ctx, builder) -> {
-                                            commandManager.getCommands().keySet().forEach(builder::suggest);
+                                            commandManager.getCommands().keySet().forEach(name -> {
+                                                if (name.contains(" ")) {
+                                                    builder.suggest('"' + name + '"');
+                                                } else {
+                                                    builder.suggest(name);
+                                                }
+                                            });
                                             return builder.buildFuture();
                                         })
                                         .executes(ctx -> {
                                             String cmd = com.mojang.brigadier.arguments.StringArgumentType
-                                                    .getString(ctx, "commandname").trim();
+                                                    .getString(ctx, "commandname");
+                                            cmd = normalizeCommandPath(cmd);
                                             LOGGER.info("[CGEN DEBUG] remove: cmd='{}'", cmd);
 
                                             if (!commandManager.removeCommand(cmd)) {
@@ -150,8 +176,7 @@ public class DatapackCommands implements ModInitializer {
                                                 return 0;
                                             }
 
-                                            // Unregister the root token from Brigadier
-                                            unregisterCommand(dispatcher, cmd.split(" ")[0]);
+                                            rebuildCustomCommands(dispatcher);
                                             ctx.getSource().sendMessage(Text.literal("Command /" + cmd + " removed!"));
                                             return 1;
                                         })
@@ -212,15 +237,24 @@ public class DatapackCommands implements ModInitializer {
         LOGGER.info("[CGEN DEBUG] Auto-registering {} saved commands",
                 commandManager.getCommands().size());
         commandManager.getCommands().forEach((cmd, func) ->
-                registerCustomCommand(dispatcher, cmd, func));
+                registerCustomCommand(dispatcher, cmd, func, false));
+        syncCommandsToAllPlayers();
+    }
+
+    private void rebuildCustomCommands(
+            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
+        clearDynamicRoots(dispatcher);
+        registerAllCustomCommands(dispatcher);
     }
 
     private void registerCustomCommand(
             com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher,
             String cmdPath,
-            String func) {
+            String func,
+            boolean syncAfter) {
         LOGGER.info("[CGEN DEBUG] Registering: /{} -> {}", cmdPath, func);
         String[] tokens = cmdPath.split(" ");
+        registeredCustomRoots.add(tokens[0]);
 
         // Innermost node: no permission requirement — anyone can execute
         com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> innermost =
@@ -275,13 +309,14 @@ public class DatapackCommands implements ModInitializer {
             );
         }
 
-        syncCommandsToAllPlayers();
+        if (syncAfter) {
+            syncCommandsToAllPlayers();
+        }
     }
 
     @SuppressWarnings("unchecked")
-    private void unregisterCommand(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher,
-            String cmd) {
+    private void clearDynamicRoots(
+            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
         try {
             com.mojang.brigadier.tree.RootCommandNode<ServerCommandSource> root = dispatcher.getRoot();
             Field childrenField  = com.mojang.brigadier.tree.CommandNode.class.getDeclaredField("children");
@@ -292,15 +327,21 @@ public class DatapackCommands implements ModInitializer {
             literalsField.setAccessible(true);
             argumentsField.setAccessible(true);
 
-            ((Map<String, ?>) childrenField.get(root)).remove(cmd);
-            ((Map<String, ?>) literalsField.get(root)).remove(cmd);
-            ((Map<String, ?>) argumentsField.get(root)).remove(cmd);
+            Map<String, ?> children = (Map<String, ?>) childrenField.get(root);
+            Map<String, ?> literals = (Map<String, ?>) literalsField.get(root);
+            Map<String, ?> arguments = (Map<String, ?>) argumentsField.get(root);
 
-            LOGGER.info("[CGEN DEBUG] Unregistered /{} from dispatcher via reflection", cmd);
+            for (String dynamicRoot : registeredCustomRoots) {
+                children.remove(dynamicRoot);
+                literals.remove(dynamicRoot);
+                arguments.remove(dynamicRoot);
+            }
+
+            LOGGER.info("[CGEN DEBUG] Cleared {} dynamic roots", registeredCustomRoots.size());
+            registeredCustomRoots.clear();
         } catch (Exception e) {
-            LOGGER.error("[CGEN DEBUG] Failed to unregister /{} from dispatcher: {}", cmd, e.getMessage());
+            LOGGER.error("[CGEN DEBUG] Failed to clear dynamic roots from dispatcher: {}", e.getMessage());
         }
-        syncCommandsToAllPlayers();
     }
 
     private void syncCommandsToAllPlayers() {
@@ -317,6 +358,34 @@ public class DatapackCommands implements ModInitializer {
 
     private boolean isValidFunctionName(String name) {
         return name.matches("[a-z0-9_\\-]+:[a-z0-9_\\-./]+");
+    }
+
+    private String normalizeCommandPath(String path) {
+        if (path == null) return "";
+        return Arrays.stream(path.trim().split("\\\\s+"))
+                .filter(token -> !token.isEmpty())
+                .reduce((a, b) -> a + " " + b)
+                .orElse("");
+    }
+
+    private boolean isValidCommandPath(String path) {
+        if (path.isEmpty()) return false;
+        String[] tokens = path.split(" ");
+        for (String token : tokens) {
+            if (token.length() > 32) return false;
+            if (!token.matches("[A-Za-z0-9_]+")) return false;
+        }
+        return true;
+    }
+
+    private boolean isConflictingRoot(
+            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher,
+            String path) {
+        String root = path.split(" ")[0];
+        boolean alreadyOwnedByCgen = commandManager.getCommands().keySet().stream()
+                .map(name -> name.split(" ")[0])
+                .anyMatch(root::equals);
+        return dispatcher.getRoot().getChild(root) != null && !alreadyOwnedByCgen;
     }
 
     public static CommandManager getCommandManager() {
