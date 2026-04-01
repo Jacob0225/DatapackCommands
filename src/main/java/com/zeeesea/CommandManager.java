@@ -23,7 +23,6 @@ public class CommandManager {
         load();
     }
 
-    // Internal DTO for JSON serialization
     private static class ConfigData {
         Map<String, String> commands = new HashMap<>();
         boolean feedbackEnabled = false;
@@ -46,7 +45,6 @@ public class CommandManager {
         ConfigData data = new ConfigData();
         data.commands = this.commands;
         data.feedbackEnabled = this.feedbackEnabled;
-        // Ensure parent directory exists (e.g. first run)
         file.getParentFile().mkdirs();
         try (FileWriter writer = new FileWriter(file)) {
             gson.toJson(data, writer);

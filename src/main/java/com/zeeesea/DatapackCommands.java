@@ -57,10 +57,8 @@ public class DatapackCommands implements ModInitializer {
      * - Other entities: denied by default.
      */
     private static boolean isOperator(ServerCommandSource source) {
-        // Console, command blocks, etc. have no entity — always allow
         if (source.getEntity() == null) return true;
 
-        // Player check via PlayerManager — this is the same check vanilla uses internally
         if (source.getEntity() instanceof net.minecraft.server.network.ServerPlayerEntity player) {
             return source.getServer().getPlayerManager()
                     .isOperator(player.getPlayerConfigEntry());
@@ -76,9 +74,7 @@ public class DatapackCommands implements ModInitializer {
     private static final SuggestionProvider<ServerCommandSource> FUNCTION_SUGGESTIONS =
             (ctx, builder) -> {
                 MinecraftServer server = ctx.getSource().getServer();
-                // getServer() can be null on pure client — guard just in case
                 if (server == null) return builder.buildFuture();
-                // getAllFunctions() returns Iterable<Identifier> — convert via StreamSupport
                 StreamSupport.stream(
                                 server.getCommandFunctionManager().getAllFunctions().spliterator(), false)
                         .map(Identifier::toString)
@@ -229,15 +225,12 @@ public class DatapackCommands implements ModInitializer {
         // Innermost node: no permission requirement — anyone can execute
         com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> innermost =
                 net.minecraft.server.command.CommandManager.literal(tokens[tokens.length - 1])
-                        .requires(source -> true) // visible and usable by everyone
+                        .requires(source -> true)
                         .executes(ctx -> {
                             MinecraftServer server = ctx.getSource().getServer();
                             ServerCommandSource source = ctx.getSource();
                             String execCmd = "function " + func;
 
-                            // Run from a server-authoritative source so non-OP players can trigger
-                            // mapped functions, but mirror caller context so @s and relative coords
-                            // behave like the triggering player.
                             ServerCommandSource execSource = server.getCommandSource()
                                     .withPosition(source.getPosition())
                                     .withRotation(source.getRotation())
