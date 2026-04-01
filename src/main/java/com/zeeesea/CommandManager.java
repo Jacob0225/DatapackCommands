@@ -1,21 +1,13 @@
 package com.zeeesea;
 
 import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
-import com.mojang.brigadier.CommandDispatcher;
-import com.mojang.brigadier.context.CommandContext;
-import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.lang.reflect.Type;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -24,12 +16,14 @@ public class CommandManager {
     private final File file;
     private final Gson gson = new Gson();
     private final Map<String, String> commands = new HashMap<>();
+    private boolean feedbackEnabled = false;
 
-    public CommandManager(File configDir) {
-        this.file = new File(configDir, COMMANDS_FILE);
+    public CommandManager(File worldDir) {
+        this.file = new File(worldDir, COMMANDS_FILE);
         load();
     }
 
+    // Internal DTO for JSON serialization
     private static class ConfigData {
         Map<String, String> commands = new HashMap<>();
         boolean feedbackEnabled = false;
@@ -52,6 +46,8 @@ public class CommandManager {
         ConfigData data = new ConfigData();
         data.commands = this.commands;
         data.feedbackEnabled = this.feedbackEnabled;
+        // Ensure parent directory exists (e.g. first run)
+        file.getParentFile().mkdirs();
         try (FileWriter writer = new FileWriter(file)) {
             gson.toJson(data, writer);
         } catch (IOException e) {
@@ -59,6 +55,10 @@ public class CommandManager {
         }
     }
 
+    /**
+     * Registers a new command mapping.
+     * Returns false if a mapping for that name already exists.
+     */
     public boolean registerCommand(String name, String function) {
         if (commands.containsKey(name)) return false;
         commands.put(name, function);
@@ -66,14 +66,16 @@ public class CommandManager {
         return true;
     }
 
+    /**
+     * Removes a command mapping.
+     * Returns false if no mapping with that name exists.
+     */
     public boolean removeCommand(String name) {
         if (!commands.containsKey(name)) return false;
         commands.remove(name);
         save();
         return true;
     }
-
-    private boolean feedbackEnabled = false;
 
     public boolean isFeedbackEnabled() {
         return feedbackEnabled;
