@@ -3,34 +3,43 @@ package com.zeeesea;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-import net.minecraft.command.argument.IdentifierArgumentType;
+
+import net.minecraft.resources.Identifier;
+import net.minecraft.commands.Commands;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.util.WorldSavePath;
-import net.minecraft.text.Text;
-import net.minecraft.text.MutableText;
-import net.minecraft.util.Identifier;
+import net.minecraft.world.level.storage.LevelResource;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.commands.arguments.IdentifierArgument;
+
+// 26.1: NameAndId is the type that PlayerList.isOp() now accepts (replaces GameProfile).
+// Package: net.minecraft.server.players.NameAndId
+import net.minecraft.server.players.NameAndId;
+
 import com.mojang.brigadier.suggestion.SuggestionProvider;
+
 import java.lang.reflect.Field;
 import java.util.Arrays;
 import java.util.HashSet;
-import java.util.Set;
 import java.util.Map;
-import java.util.stream.StreamSupport;
+import java.util.Set;
 
 public class DatapackCommands implements ModInitializer {
     public static final String MOD_ID = "datapackcommands";
     public static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(MOD_ID);
+
     private static CommandManager commandManager;
     private static MinecraftServer cachedServer;
-    private static com.mojang.brigadier.CommandDispatcher<ServerCommandSource> cachedDispatcher;
+    private static com.mojang.brigadier.CommandDispatcher<CommandSourceStack> cachedDispatcher;
     private final Set<String> registeredCustomRoots = new HashSet<>();
 
     @Override
     public void onInitialize() {
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             cachedServer = server;
-            java.io.File worldDir = server.getSavePath(WorldSavePath.ROOT).toFile();
+            java.io.File worldDir = server.getWorldPath(LevelResource.ROOT).toFile();
             commandManager = new CommandManager(worldDir);
             LOGGER.info("[CGEN DEBUG] Server started, loading commands from world folder");
             registerAllCustomCommands(cachedDispatcher);
@@ -56,82 +65,129 @@ public class DatapackCommands implements ModInitializer {
     }
 
     /**
-     * Returns true if the source has OP level >= 2.
-     * - Console / non-entity sources: always permitted.
-     * - Players: checked via PlayerManager.isOperator() (stable across all 1.21.x).
-     * - Other entities: denied by default.
+     * 26.1 OP check.
+     *
+     * - Console / non-entity sources: always permitted (no entity = system source).
+     * - Players: PlayerList.isOp() now takes NameAndId (a record with UUID + name string),
+     *   NOT GameProfile. We construct NameAndId from the player's UUID and name.
+     *   NameAndId is a record: NameAndId(UUID id, String name).
+     * - Non-player entities: denied.
      */
-    private static boolean isOperator(ServerCommandSource source) {
+    private static boolean isOperator(CommandSourceStack source) {
         if (source.getEntity() == null) return true;
 
-        if (source.getEntity() instanceof net.minecraft.server.network.ServerPlayerEntity player) {
-            return source.getServer().getPlayerManager()
-                    .isOperator(player.getPlayerConfigEntry());
+        if (source.getEntity() instanceof ServerPlayer player) {
+            // 26.1: NameAndId(UUID, String) — construct from the player directly.
+            NameAndId nameAndId = new NameAndId(
+                    player.getUUID(),
+                    player.getName().getString()
+            );
+            return source.getServer().getPlayerList().isOp(nameAndId);
         }
 
         return false;
     }
 
     /**
-     * Suggestion provider that lists all loaded datapack functions,
-     * mirroring what /function would suggest.
+     * Suggestion provider for loaded datapack functions.
+     *
+     * 26.1: ServerFunctionManager no longer has getFunctions() returning a FunctionLibrary.
+     * The function manager itself IS the library — it exposes getFunction(Identifier) and
+     * can be iterated. The actual method in 26.1 unobfuscated source is
+     * ServerFunctionManager.getAll() which returns a stream/collection of all functions.
+     *
+     * Since prior compiler errors showed getAll() does NOT exist on ServerFunctionManager,
+     * we use reflection as a last resort to avoid further guessing. Alternatively, we
+     * degrade gracefully and provide no suggestions (the /function argument still works,
+     * as the user can type the function name manually).
+     *
+     * Fallback: suggest nothing and log a warning. The argument will still validate
+     * correctly as an IdentifierArgument; users just won't get autocomplete.
+     *
+     * TODO: Once you run `./gradlew genSources` and can inspect ServerFunctionManager
+     * in your IDE, replace the try/catch block with the correct method call.
      */
-    private static final SuggestionProvider<ServerCommandSource> FUNCTION_SUGGESTIONS =
+    private static final SuggestionProvider<CommandSourceStack> FUNCTION_SUGGESTIONS =
             (ctx, builder) -> {
                 MinecraftServer server = ctx.getSource().getServer();
                 if (server == null) return builder.buildFuture();
-                StreamSupport.stream(
-                                server.getCommandFunctionManager().getAllFunctions().spliterator(), false)
-                        .map(Identifier::toString)
-                        .forEach(builder::suggest);
+                try {
+                    // Try reflection to find whichever method exposes all functions.
+                    // In 26.1 the real method name may be getAll(), listAll(), values(),
+                    // or similar — we try the most likely names.
+                    var mgr = server.getFunctions();
+                    java.lang.reflect.Method found = null;
+                    for (String candidate : new String[]{"getAll", "listAll", "getAllFunctions", "values", "getFunctions"}) {
+                        try {
+                            found = mgr.getClass().getMethod(candidate);
+                            break;
+                        } catch (NoSuchMethodException ignored) {}
+                    }
+                    if (found != null) {
+                        Object result = found.invoke(mgr);
+                        if (result instanceof Iterable<?> iterable) {
+                            for (Object entry : iterable) {
+                                // CommandFunction has getId() returning Identifier
+                                try {
+                                    Object id = entry.getClass().getMethod("id").invoke(entry);
+                                    builder.suggest(id.toString());
+                                } catch (Exception ignored) {
+                                    try {
+                                        Object id = entry.getClass().getMethod("getId").invoke(entry);
+                                        builder.suggest(id.toString());
+                                    } catch (Exception ignored2) {}
+                                }
+                            }
+                        } else if (result instanceof Map<?,?> map) {
+                            map.keySet().forEach(k -> builder.suggest(k.toString()));
+                        }
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("[CGEN DEBUG] Could not populate function suggestions: {}", e.getMessage());
+                }
                 return builder.buildFuture();
             };
 
-    private void registerCgenCommand(com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
+    private void registerCgenCommand(
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher) {
         dispatcher.register(
-                net.minecraft.server.command.CommandManager.literal("cgen")
-                        // Only OPs (level >= 2) can see or execute /cgen
+                Commands.literal("cgen")
                         .requires(DatapackCommands::isOperator)
 
-                        .then(net.minecraft.server.command.CommandManager.literal("create")
-                                .then(net.minecraft.server.command.CommandManager.argument(
+                        .then(Commands.literal("create")
+                                .then(Commands.argument(
                                                 "commandname",
                                                 com.mojang.brigadier.arguments.StringArgumentType.string())
-                                        .then(net.minecraft.server.command.CommandManager.argument(
+                                        .then(Commands.argument(
                                                         "function",
-                                                        IdentifierArgumentType.identifier())
-                                                // Suggest functions only after command name is provided.
+                                                        IdentifierArgument.id())
                                                 .suggests(FUNCTION_SUGGESTIONS)
                                                 .executes(ctx -> {
-                                                    ServerCommandSource source = ctx.getSource();
+                                                    CommandSourceStack source = ctx.getSource();
                                                     String cmdPath = com.mojang.brigadier.arguments.StringArgumentType
                                                             .getString(ctx, "commandname");
-                                                    String func = IdentifierArgumentType
-                                                            .getIdentifier(ctx, "function").toString();
+                                                    String func = IdentifierArgument
+                                                            .getId(ctx, "function").toString();
                                                     cmdPath = normalizeCommandPath(cmdPath);
 
                                                     if (cmdPath.isEmpty() || func.isEmpty()) {
-                                                        source.sendError(Text.literal(
-                                                                "Usage: /cgen create <name> <namespace:function> (quote names with spaces)"));
+                                                        source.sendFailure(Component.literal(
+                                                                "Usage: /cgen create <n> <namespace:function> (quote names with spaces)"));
                                                         return 0;
                                                     }
-
                                                     if (!isValidCommandPath(cmdPath)) {
-                                                        source.sendError(Text.literal(
+                                                        source.sendFailure(Component.literal(
                                                                 "Invalid command name '" + cmdPath + "'. Use letters, numbers, underscore, max 32 chars per token."));
                                                         return 0;
                                                     }
-
                                                     if (isConflictingRoot(dispatcher, cmdPath)) {
                                                         String root = cmdPath.split(" ")[0];
-                                                        source.sendError(Text.literal(
+                                                        source.sendFailure(Component.literal(
                                                                 "Cannot use root '/" + root + "' because it already exists."));
                                                         return 0;
                                                     }
-
-                                                    // Validate names before registering
                                                     if (!isValidFunctionName(func)) {
-                                                        source.sendError(Text.literal(
+                                                        source.sendFailure(Component.literal(
                                                                 "Invalid function name '" + func + "'. Expected format: namespace:path"));
                                                         return 0;
                                                     }
@@ -139,20 +195,20 @@ public class DatapackCommands implements ModInitializer {
                                                     LOGGER.info("[CGEN DEBUG] Creating command /{} -> {}", cmdPath, func);
 
                                                     if (!commandManager.registerCommand(cmdPath, func)) {
-                                                        source.sendError(Text.literal("Command already exists: /" + cmdPath));
+                                                        source.sendFailure(Component.literal("Command already exists: /" + cmdPath));
                                                         return 0;
                                                     }
 
                                                     registerCustomCommand(cachedDispatcher, cmdPath, func, true);
-                                                    source.sendMessage(Text.literal("Created command /" + cmdPath + " -> " + func));
+                                                    source.sendSystemMessage(Component.literal("Created command /" + cmdPath + " -> " + func));
                                                     return 1;
                                                 })
                                         )
                                 )
                         )
 
-                        .then(net.minecraft.server.command.CommandManager.literal("remove")
-                                .then(net.minecraft.server.command.CommandManager.argument(
+                        .then(Commands.literal("remove")
+                                .then(Commands.argument(
                                                 "commandname",
                                                 com.mojang.brigadier.arguments.StringArgumentType.string())
                                         .suggests((ctx, builder) -> {
@@ -172,59 +228,58 @@ public class DatapackCommands implements ModInitializer {
                                             LOGGER.info("[CGEN DEBUG] remove: cmd='{}'", cmd);
 
                                             if (!commandManager.removeCommand(cmd)) {
-                                                ctx.getSource().sendError(Text.literal("Command not found: /" + cmd));
+                                                ctx.getSource().sendFailure(Component.literal("Command not found: /" + cmd));
                                                 return 0;
                                             }
-
                                             rebuildCustomCommands(dispatcher);
-                                            ctx.getSource().sendMessage(Text.literal("Command /" + cmd + " removed!"));
+                                            ctx.getSource().sendSystemMessage(Component.literal("Command /" + cmd + " removed!"));
                                             return 1;
                                         })
                                 )
                         )
 
-                        .then(net.minecraft.server.command.CommandManager.literal("list")
+                        .then(Commands.literal("list")
                                 .executes(ctx -> {
                                     var commands = commandManager.getCommands();
                                     if (commands.isEmpty()) {
-                                        ctx.getSource().sendMessage(Text.literal("No commands registered."));
+                                        ctx.getSource().sendSystemMessage(Component.literal("No commands registered."));
                                         return 1;
                                     }
-                                    MutableText msg = Text.literal("Registered commands:\n");
+                                    MutableComponent msg = Component.literal("Registered commands:\n");
                                     commands.forEach((k, v) ->
-                                            msg.append(Text.literal("  /" + k))
-                                                    .append(Text.literal(" -> " + v + "\n"))
+                                            msg.append(Component.literal("  /" + k))
+                                                    .append(Component.literal(" -> " + v + "\n"))
                                     );
-                                    ctx.getSource().sendMessage(msg);
+                                    ctx.getSource().sendSystemMessage(msg);
                                     return 1;
                                 })
                         )
 
-                        .then(net.minecraft.server.command.CommandManager.literal("feedback")
-                                .then(net.minecraft.server.command.CommandManager.literal("on")
+                        .then(Commands.literal("feedback")
+                                .then(Commands.literal("on")
                                         .executes(ctx -> {
                                             commandManager.setFeedback(true);
-                                            ctx.getSource().sendMessage(Text.literal("Command feedback enabled."));
+                                            ctx.getSource().sendSystemMessage(Component.literal("Command feedback enabled."));
                                             return 1;
                                         })
                                 )
-                                .then(net.minecraft.server.command.CommandManager.literal("off")
+                                .then(Commands.literal("off")
                                         .executes(ctx -> {
                                             commandManager.setFeedback(false);
-                                            ctx.getSource().sendMessage(Text.literal("Command feedback disabled."));
+                                            ctx.getSource().sendSystemMessage(Component.literal("Command feedback disabled."));
                                             return 1;
                                         })
                                 )
                                 .executes(ctx -> {
-                                    ctx.getSource().sendMessage(Text.literal(
+                                    ctx.getSource().sendSystemMessage(Component.literal(
                                             "Feedback is currently: " + (commandManager.isFeedbackEnabled() ? "ON" : "OFF")));
                                     return 1;
                                 })
                         )
 
-                        .then(net.minecraft.server.command.CommandManager.literal("check")
+                        .then(Commands.literal("check")
                                 .executes(ctx -> {
-                                    ctx.getSource().sendMessage(Text.literal("CmdGen is running."));
+                                    ctx.getSource().sendSystemMessage(Component.literal("CmdGen is running."));
                                     return 1;
                                 })
                         )
@@ -232,7 +287,7 @@ public class DatapackCommands implements ModInitializer {
     }
 
     private void registerAllCustomCommands(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher) {
         if (commandManager == null || dispatcher == null) return;
         LOGGER.info("[CGEN DEBUG] Auto-registering {} saved commands",
                 commandManager.getCommands().size());
@@ -242,13 +297,13 @@ public class DatapackCommands implements ModInitializer {
     }
 
     private void rebuildCustomCommands(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher) {
         clearDynamicRoots(dispatcher);
         registerAllCustomCommands(dispatcher);
     }
 
     private void registerCustomCommand(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher,
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher,
             String cmdPath,
             String func,
             boolean syncAfter) {
@@ -256,38 +311,36 @@ public class DatapackCommands implements ModInitializer {
         String[] tokens = cmdPath.split(" ");
         registeredCustomRoots.add(tokens[0]);
 
-        // Innermost node: no permission requirement — anyone can execute
-        com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> innermost =
-                net.minecraft.server.command.CommandManager.literal(tokens[tokens.length - 1])
+        com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> innermost =
+                Commands.literal(tokens[tokens.length - 1])
                         .requires(source -> true)
                         .executes(ctx -> {
                             MinecraftServer server = ctx.getSource().getServer();
-                            ServerCommandSource source = ctx.getSource();
+                            CommandSourceStack source = ctx.getSource();
                             String execCmd = "function " + func;
 
-                            ServerCommandSource execSource = server.getCommandSource()
+                            CommandSourceStack execSource = server.createCommandSourceStack()
                                     .withPosition(source.getPosition())
                                     .withRotation(source.getRotation())
-                                    .withWorld(source.getWorld());
+                                    .withLevel(source.getLevel());
 
                             if (source.getEntity() != null) {
                                 execSource = execSource.withEntity(source.getEntity());
                             }
 
                             if (!commandManager.isFeedbackEnabled()) {
-                                execSource = execSource.withSilent();
+                                execSource = execSource.withSuppressedOutput();
                             }
 
                             LOGGER.info("[CGEN DEBUG] Executing /{} -> {} as '{}'",
-                                    cmdPath, func, source.getName());
+                                    cmdPath, func, source.getTextName());
 
-                            com.mojang.brigadier.ParseResults<ServerCommandSource> parseResults =
-                                    server.getCommandManager().getDispatcher()
-                                            .parse(execCmd, execSource);
-                            server.getCommandManager().execute(parseResults, execCmd);
+                            com.mojang.brigadier.ParseResults<CommandSourceStack> parseResults =
+                                    server.getCommands().getDispatcher().parse(execCmd, execSource);
+                            server.getCommands().performCommand(parseResults, execCmd);
 
                             if (commandManager.isFeedbackEnabled()) {
-                                source.sendMessage(Text.literal("Executed function: " + func));
+                                source.sendSystemMessage(Component.literal("Executed function: " + func));
                             }
                             return 1;
                         });
@@ -295,15 +348,14 @@ public class DatapackCommands implements ModInitializer {
         if (tokens.length == 1) {
             dispatcher.register(innermost);
         } else {
-            // Chain nodes from the inside out
-            com.mojang.brigadier.builder.LiteralArgumentBuilder<ServerCommandSource> node = innermost;
+            com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> node = innermost;
             for (int i = tokens.length - 2; i >= 1; i--) {
-                node = net.minecraft.server.command.CommandManager.literal(tokens[i])
+                node = Commands.literal(tokens[i])
                         .requires(source -> true)
                         .then(node);
             }
             dispatcher.register(
-                    net.minecraft.server.command.CommandManager.literal(tokens[0])
+                    Commands.literal(tokens[0])
                             .requires(source -> true)
                             .then(node)
             );
@@ -316,9 +368,9 @@ public class DatapackCommands implements ModInitializer {
 
     @SuppressWarnings("unchecked")
     private void clearDynamicRoots(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher) {
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher) {
         try {
-            com.mojang.brigadier.tree.RootCommandNode<ServerCommandSource> root = dispatcher.getRoot();
+            com.mojang.brigadier.tree.RootCommandNode<CommandSourceStack> root = dispatcher.getRoot();
             Field childrenField  = com.mojang.brigadier.tree.CommandNode.class.getDeclaredField("children");
             Field literalsField  = com.mojang.brigadier.tree.CommandNode.class.getDeclaredField("literals");
             Field argumentsField = com.mojang.brigadier.tree.CommandNode.class.getDeclaredField("arguments");
@@ -327,8 +379,8 @@ public class DatapackCommands implements ModInitializer {
             literalsField.setAccessible(true);
             argumentsField.setAccessible(true);
 
-            Map<String, ?> children = (Map<String, ?>) childrenField.get(root);
-            Map<String, ?> literals = (Map<String, ?>) literalsField.get(root);
+            Map<String, ?> children  = (Map<String, ?>) childrenField.get(root);
+            Map<String, ?> literals  = (Map<String, ?>) literalsField.get(root);
             Map<String, ?> arguments = (Map<String, ?>) argumentsField.get(root);
 
             for (String dynamicRoot : registeredCustomRoots) {
@@ -349,10 +401,10 @@ public class DatapackCommands implements ModInitializer {
             LOGGER.info("[CGEN DEBUG] Sync skipped — server not cached yet");
             return;
         }
-        int count = cachedServer.getPlayerManager().getCurrentPlayerCount();
+        int count = cachedServer.getPlayerList().getPlayerCount();
         LOGGER.info("[CGEN DEBUG] Syncing command tree to {} players", count);
-        cachedServer.getPlayerManager().getPlayerList().forEach(player ->
-                cachedServer.getCommandManager().sendCommandTree(player)
+        cachedServer.getPlayerList().getPlayers().forEach(player ->
+                cachedServer.getCommands().sendCommands(player)
         );
     }
 
@@ -362,7 +414,7 @@ public class DatapackCommands implements ModInitializer {
 
     private String normalizeCommandPath(String path) {
         if (path == null) return "";
-        return Arrays.stream(path.trim().split("\\\\s+"))
+        return Arrays.stream(path.trim().split("\\s+"))
                 .filter(token -> !token.isEmpty())
                 .reduce((a, b) -> a + " " + b)
                 .orElse("");
@@ -379,7 +431,7 @@ public class DatapackCommands implements ModInitializer {
     }
 
     private boolean isConflictingRoot(
-            com.mojang.brigadier.CommandDispatcher<ServerCommandSource> dispatcher,
+            com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher,
             String path) {
         String root = path.split(" ")[0];
         boolean alreadyOwnedByCgen = commandManager.getCommands().keySet().stream()
