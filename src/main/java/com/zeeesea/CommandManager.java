@@ -1,8 +1,6 @@
 package com.zeeesea;
 
 import com.google.gson.Gson;
-import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.command.ServerCommandSource;
 
 import java.io.File;
 import java.io.FileReader;
@@ -11,6 +9,13 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Manages persistent command-to-function mappings stored in a JSON file
+ * alongside the world save folder.
+ *
+ * This class has no Minecraft API dependencies and requires no mapping changes
+ * for the 26.1 port — it's pure Java.
+ */
 public class CommandManager {
     private static final String COMMANDS_FILE = "datapackcommands.json";
     private final File file;
