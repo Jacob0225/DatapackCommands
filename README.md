@@ -1,6 +1,6 @@
 # Datapack-Commands
 
-A Fabric mod for Minecraft 1.21.11 that lets datapack creators create custom slash commands that execute datapack functions. Commands are registered at runtime, persist across restarts, and show up in tab completion for all players — no server restart required.
+A Fabric mod for Minecraft 1.20.5-26.1+ that lets datapack creators create custom slash commands that execute datapack functions. Commands are registered at runtime, persist across restarts, and show up in tab completion for all players — no server restart required.
 
 ---
 
