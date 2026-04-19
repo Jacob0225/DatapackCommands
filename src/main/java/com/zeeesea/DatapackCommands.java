@@ -19,12 +19,16 @@ import net.minecraft.commands.arguments.IdentifierArgument;
 import net.minecraft.server.players.NameAndId;
 
 import com.mojang.brigadier.suggestion.SuggestionProvider;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Stream;
 
 public class DatapackCommands implements ModInitializer {
     public static final String MOD_ID = "datapackcommands";
@@ -88,65 +92,81 @@ public class DatapackCommands implements ModInitializer {
         return false;
     }
 
-    /**
-     * Suggestion provider for loaded datapack functions.
-     *
-     * 26.1: ServerFunctionManager no longer has getFunctions() returning a FunctionLibrary.
-     * The function manager itself IS the library — it exposes getFunction(Identifier) and
-     * can be iterated. The actual method in 26.1 unobfuscated source is
-     * ServerFunctionManager.getAll() which returns a stream/collection of all functions.
-     *
-     * Since prior compiler errors showed getAll() does NOT exist on ServerFunctionManager,
-     * we use reflection as a last resort to avoid further guessing. Alternatively, we
-     * degrade gracefully and provide no suggestions (the /function argument still works,
-     * as the user can type the function name manually).
-     *
-     * Fallback: suggest nothing and log a warning. The argument will still validate
-     * correctly as an IdentifierArgument; users just won't get autocomplete.
-     *
-     * TODO: Once you run `./gradlew genSources` and can inspect ServerFunctionManager
-     * in your IDE, replace the try/catch block with the correct method call.
-     */
     private static final SuggestionProvider<CommandSourceStack> FUNCTION_SUGGESTIONS =
             (ctx, builder) -> {
                 MinecraftServer server = ctx.getSource().getServer();
                 if (server == null) return builder.buildFuture();
                 try {
-                    // Try reflection to find whichever method exposes all functions.
-                    // In 26.1 the real method name may be getAll(), listAll(), values(),
-                    // or similar — we try the most likely names.
-                    var mgr = server.getFunctions();
-                    java.lang.reflect.Method found = null;
-                    for (String candidate : new String[]{"getAll", "listAll", "getAllFunctions", "values", "getFunctions"}) {
+                    Object manager = server.getFunctions();
+                    Method found = null;
+                    for (String candidate : new String[]{
+                            "getFunctionNames", "getAvailableFunctions", "getFunctions", "listFunctions", "getAll", "values"
+                    }) {
                         try {
-                            found = mgr.getClass().getMethod(candidate);
+                            found = manager.getClass().getMethod(candidate);
                             break;
                         } catch (NoSuchMethodException ignored) {}
                     }
                     if (found != null) {
-                        Object result = found.invoke(mgr);
-                        if (result instanceof Iterable<?> iterable) {
-                            for (Object entry : iterable) {
-                                // CommandFunction has getId() returning Identifier
-                                try {
-                                    Object id = entry.getClass().getMethod("id").invoke(entry);
-                                    builder.suggest(id.toString());
-                                } catch (Exception ignored) {
-                                    try {
-                                        Object id = entry.getClass().getMethod("getId").invoke(entry);
-                                        builder.suggest(id.toString());
-                                    } catch (Exception ignored2) {}
-                                }
-                            }
-                        } else if (result instanceof Map<?,?> map) {
-                            map.keySet().forEach(k -> builder.suggest(k.toString()));
-                        }
+                        Object result = found.invoke(manager);
+                        suggestFunctionIds(result, builder);
                     }
                 } catch (Exception e) {
                     LOGGER.warn("[CGEN DEBUG] Could not populate function suggestions: {}", e.getMessage());
                 }
                 return builder.buildFuture();
             };
+
+    private static void suggestFunctionIds(Object result, SuggestionsBuilder builder) {
+        if (result instanceof Map<?, ?> map) {
+            for (Object key : map.keySet()) {
+                if (key != null) builder.suggest(key.toString());
+            }
+            return;
+        }
+
+        if (result instanceof Stream<?> stream) {
+            List<?> collected = stream.toList();
+            for (Object entry : collected) {
+                suggestFunctionEntry(entry, builder);
+            }
+            return;
+        }
+
+        if (result instanceof Iterable<?> iterable) {
+            for (Object entry : iterable) {
+                suggestFunctionEntry(entry, builder);
+            }
+        }
+    }
+
+    private static void suggestFunctionEntry(Object entry, SuggestionsBuilder builder) {
+        if (entry == null) return;
+        if (entry instanceof Identifier id) {
+            builder.suggest(id.toString());
+            return;
+        }
+
+        try {
+            Method idMethod = entry.getClass().getMethod("id");
+            Object id = idMethod.invoke(entry);
+            if (id != null) {
+                builder.suggest(id.toString());
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        try {
+            Method getIdMethod = entry.getClass().getMethod("getId");
+            Object id = getIdMethod.invoke(entry);
+            if (id != null) {
+                builder.suggest(id.toString());
+                return;
+            }
+        } catch (Exception ignored) {}
+
+        builder.suggest(entry.toString());
+    }
 
     private void registerCgenCommand(
             com.mojang.brigadier.CommandDispatcher<CommandSourceStack> dispatcher) {
